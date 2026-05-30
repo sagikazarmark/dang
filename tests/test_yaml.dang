@@ -1,0 +1,41 @@
+# Test value YAML marshaling
+
+type YAMLUser {
+  pub id: Int!
+  pub active: Boolean!
+}
+
+type YAMLObject {
+  pub user: YAMLUser!
+  pub count: Int!
+}
+
+pub obj1 = {{name: "test", value: 42}}
+pub yaml1 = toYAML(value: obj1)
+
+assert { yaml1.contains("name: test\n") }
+assert { yaml1.contains("value: 42\n") }
+
+pub obj2 = {{user: {{id: 1, active: true}}, count: 100}}
+pub yaml2 = toYAML(value: obj2)
+let parsed2: YAMLObject! = fromYAML(yaml2)
+
+assert { parsed2.count == 100 }
+assert { parsed2.user.id == 1 }
+assert { parsed2.user.active == true }
+
+pub nums: [Int] = [1, 2, 3]
+pub emptyFiltered = nums.filter { x => false }
+pub yaml3 = toYAML(value: emptyFiltered)
+assert { yaml3 == "[]\n" }
+
+pub raw = fromJSON("{\"value\":42,\"list\":[1,2]}")
+pub yaml4 = toYAML(value: raw)
+assert { yaml4.contains("value: 42\n") }
+assert { yaml4.contains("- 1\n") }
+assert { yaml4.contains("- 2\n") }
+
+assert { toYAML(value: "hello") == "hello\n" }
+assert { toYAML(value: 42) == "42\n" }
+
+print("YAML marshaling tests passed!")

@@ -43,6 +43,20 @@ func registerStdlib() {
 			return ToValue(string(jsonBytes))
 		})
 
+	// toYAML function: toYAML(value: b) -> String!
+	Builtin("toYAML").
+		Doc("serializes a value to YAML").
+		Params("value", TypeVar('b')).
+		Returns(NonNull(StringType)).
+		Impl(func(ctx context.Context, args Args) (Value, error) {
+			val, _ := args.Get("value")
+			yamlBytes, err := encodeYAML(ctx, val)
+			if err != nil {
+				return nil, fmt.Errorf("toYAML: %w", err)
+			}
+			return ToValue(string(yamlBytes))
+		})
+
 	// fromJSON function: fromJSON(data: String!) -> a
 	Builtin("fromJSON").
 		Doc("parses JSON into an opaque value that is materialized by an expected type").

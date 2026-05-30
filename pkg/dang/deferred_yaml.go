@@ -1,6 +1,7 @@
 package dang
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,105 @@ func decodeYAML(data string) (any, error) {
 	}
 
 	return yamlNodeToDeferredRaw(&doc, map[*yaml.Node]bool{})
+}
+
+func encodeYAML(ctx context.Context, val Value) ([]byte, error) {
+	raw, err := valueToYAMLRaw(ctx, val)
+	if err != nil {
+		return nil, err
+	}
+	return yaml.Marshal(raw)
+}
+
+func valueToYAMLRaw(ctx context.Context, val Value) (any, error) {
+	switch v := val.(type) {
+	case DeferredValue:
+		return deferredRawToYAMLRaw(v.Raw)
+	case StringValue:
+		return v.Val, nil
+	case EnumValue:
+		return v.Val, nil
+	case ScalarValue:
+		return v.Val, nil
+	case IntValue:
+		return v.Val, nil
+	case FloatValue:
+		return v.Val, nil
+	case BoolValue:
+		return v.Val, nil
+	case NullValue:
+		return nil, nil
+	case ListValue:
+		items := make([]any, len(v.Elements))
+		for i, elem := range v.Elements {
+			item, err := valueToYAMLRaw(ctx, elem)
+			if err != nil {
+				return nil, fmt.Errorf("[%d]: %w", i, err)
+			}
+			items[i] = item
+		}
+		return items, nil
+	case FunctionValue:
+		return nil, fmt.Errorf("cannot marshal function value")
+	case *ModuleValue:
+		obj := make(map[string]any)
+		for _, kv := range v.Bindings(PrivateVisibility) {
+			if _, isFn := kv.Value.(FunctionValue); isFn {
+				continue
+			}
+			field, err := valueToYAMLRaw(ctx, kv.Value)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", kv.Key, err)
+			}
+			obj[kv.Key] = field
+		}
+		return obj, nil
+	case BoundMethod:
+		return nil, fmt.Errorf("cannot marshal bound method value")
+	case BoundBuiltinMethod:
+		return nil, fmt.Errorf("cannot marshal bound builtin method value")
+	case GraphQLValue:
+		var id string
+		if err := v.QueryChain.Select("id").Client(v.Client).Bind(&id).Execute(ctx); err != nil {
+			return nil, err
+		}
+		return id, nil
+	default:
+		return nil, fmt.Errorf("unsupported value type: %T", val)
+	}
+}
+
+func deferredRawToYAMLRaw(raw any) (any, error) {
+	switch v := raw.(type) {
+	case json.Number:
+		tag := "!!int"
+		if strings.ContainsAny(v.String(), ".eE") {
+			tag = "!!float"
+		}
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: v.String()}, nil
+	case []any:
+		items := make([]any, len(v))
+		for i, item := range v {
+			converted, err := deferredRawToYAMLRaw(item)
+			if err != nil {
+				return nil, fmt.Errorf("[%d]: %w", i, err)
+			}
+			items[i] = converted
+		}
+		return items, nil
+	case map[string]any:
+		obj := make(map[string]any, len(v))
+		for key, value := range v {
+			converted, err := deferredRawToYAMLRaw(value)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", key, err)
+			}
+			obj[key] = converted
+		}
+		return obj, nil
+	default:
+		return raw, nil
+	}
 }
 
 func yamlNodeToDeferredRaw(node *yaml.Node, seen map[*yaml.Node]bool) (any, error) {
