@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Khan/genqlient/graphql"
 	"github.com/vektah/gqlparser/v2/ast"
 	"github.com/vektah/gqlparser/v2/gqlerror"
 	"github.com/vito/dang/v2/pkg/hm"
@@ -1931,7 +1932,7 @@ func (o *ObjectSelection) evalGraphQLInlineFragments(gqlVal GraphQLValue, ctx co
 	}
 
 	// Convert results to properly-typed Objects
-	return o.convertInlineFragmentResult(result, gqlVal.Schema, gqlVal.TypeScope)
+	return o.convertInlineFragmentResult(result, gqlVal.Schema, gqlVal.TypeScope, gqlVal.Client)
 }
 
 // evalGraphQLLazyInlineFragments handles inline fragments with no field sub-selections.
@@ -2046,12 +2047,12 @@ func (o *ObjectSelection) inlineFragmentTypeNames() string {
 }
 
 // convertInlineFragmentResult converts a GraphQL response with __typename into typed Objects.
-func (o *ObjectSelection) convertInlineFragmentResult(result any, schema *introspection.Schema, typeScope TypeScope) (Value, error) {
+func (o *ObjectSelection) convertInlineFragmentResult(result any, schema *introspection.Schema, typeScope TypeScope, client graphql.Client) (Value, error) {
 	// Handle list results
 	if resultSlice, ok := result.([]any); ok {
 		var elements []Value
 		for _, item := range resultSlice {
-			elem, err := o.convertInlineFragmentResult(item, schema, typeScope)
+			elem, err := o.convertInlineFragmentResult(item, schema, typeScope, client)
 			if err != nil {
 				return nil, err
 			}
@@ -2090,7 +2091,7 @@ func (o *ObjectSelection) convertInlineFragmentResult(result any, schema *intros
 				if fieldValue, exists := resultMap[outKey]; exists {
 					// Handle nested selections recursively
 					if field.Selection != nil {
-						nestedVal, err := o.convertNestedSelectionResult(fieldValue, field.Selection, schema, typeName, field.Name, typeScope)
+						nestedVal, err := o.convertNestedSelectionResult(fieldValue, field.Selection, schema, typeName, field.Name, typeScope, client)
 						if err != nil {
 							return nil, fmt.Errorf("converting nested field %s: %w", field.Name, err)
 						}
@@ -2113,7 +2114,7 @@ func (o *ObjectSelection) convertInlineFragmentResult(result any, schema *intros
 						typeRef = schemaField.TypeRef
 						expectedType = schemaField.Directives.ExpectedType()
 					}
-					dangVal, err := graphQLResultToValue(fieldValue, typeRef, expectedType, schema, typeScope)
+					dangVal, err := graphQLResultToValue(fieldValue, typeRef, expectedType, schema, typeScope, client)
 					if err != nil {
 						return nil, fmt.Errorf("converting field %s: %w", field.Name, err)
 					}
@@ -2130,7 +2131,7 @@ func (o *ObjectSelection) convertInlineFragmentResult(result any, schema *intros
 
 // convertNestedSelectionResult converts a nested JSON value using the
 // inferred type from a nested ObjectSelection inside an inline fragment.
-func (o *ObjectSelection) convertNestedSelectionResult(value any, sel *ObjectSelection, schema *introspection.Schema, parentTypeName string, fieldName string, typeScope TypeScope) (Value, error) {
+func (o *ObjectSelection) convertNestedSelectionResult(value any, sel *ObjectSelection, schema *introspection.Schema, parentTypeName string, fieldName string, typeScope TypeScope, client graphql.Client) (Value, error) {
 	if value == nil {
 		return NullValue{}, nil
 	}
@@ -2146,7 +2147,7 @@ func (o *ObjectSelection) convertNestedSelectionResult(value any, sel *ObjectSel
 		outKey := f.OutputKey()
 		if fv, exists := resultMap[outKey]; exists {
 			if f.Selection != nil {
-				nested, err := o.convertNestedSelectionResult(fv, f.Selection, schema, "", f.Name, typeScope)
+				nested, err := o.convertNestedSelectionResult(fv, f.Selection, schema, "", f.Name, typeScope, client)
 				if err != nil {
 					return nil, err
 				}
@@ -2284,7 +2285,7 @@ func (o *ObjectSelection) evalGraphQLSelection(gqlVal GraphQLValue, ctx context.
 	}
 
 	// Convert GraphQL result to Object
-	return o.convertGraphQLResultToModule(result, o.Fields, gqlVal.Schema, gqlVal.Field, gqlVal.TypeScope)
+	return o.convertGraphQLResultToModule(result, o.Fields, gqlVal.Schema, gqlVal.Field, gqlVal.TypeScope, gqlVal.Client)
 }
 
 // graphqlErrorFieldPath extracts the field path from a GraphQL execution error
@@ -2475,12 +2476,12 @@ func buildSelectionString(sel *ObjectSelection) string {
 	return "{ " + strings.Join(parts, " ") + " }"
 }
 
-func (o *ObjectSelection) convertGraphQLResultToModule(result any, fields []*FieldSelection, schema *introspection.Schema, parentField *introspection.Field, typeScope TypeScope) (Value, error) {
+func (o *ObjectSelection) convertGraphQLResultToModule(result any, fields []*FieldSelection, schema *introspection.Schema, parentField *introspection.Field, typeScope TypeScope, client graphql.Client) (Value, error) {
 	// Check if the result is a list/slice
 	if resultSlice, ok := result.([]any); ok {
 		var elements []Value
 		for _, item := range resultSlice {
-			itemValue, err := o.convertGraphQLResultToModule(item, fields, schema, parentField, typeScope)
+			itemValue, err := o.convertGraphQLResultToModule(item, fields, schema, parentField, typeScope, client)
 			if err != nil {
 				return nil, err
 			}
@@ -2506,7 +2507,7 @@ func (o *ObjectSelection) convertGraphQLResultToModule(result any, fields []*Fie
 				if field.Selection != nil {
 					if len(field.Selection.InlineFragments) > 0 {
 						// Nested inline fragments: dispatch to inline fragment result converter
-						nestedResult, err := field.Selection.convertInlineFragmentResult(fieldValue, schema, typeScope)
+						nestedResult, err := field.Selection.convertInlineFragmentResult(fieldValue, schema, typeScope, client)
 						if err != nil {
 							return nil, fmt.Errorf("ObjectSelection.convertGraphQLResultToModule: nested field %q inline fragments: %w", field.Name, err)
 						}
@@ -2515,7 +2516,7 @@ func (o *ObjectSelection) convertGraphQLResultToModule(result any, fields []*Fie
 						// Sub-selecting arrays
 						var elements []Value
 						for _, item := range fieldSlice {
-							itemResult, err := field.Selection.convertGraphQLResultToModule(item, field.Selection.Fields, schema, nestedField, typeScope)
+							itemResult, err := field.Selection.convertGraphQLResultToModule(item, field.Selection.Fields, schema, nestedField, typeScope, client)
 							if err != nil {
 								return nil, fmt.Errorf("ObjectSelection.convertGraphQLResultToModule: nested field %q item: %w", field.Name, err)
 							}
@@ -2524,7 +2525,7 @@ func (o *ObjectSelection) convertGraphQLResultToModule(result any, fields []*Fie
 						resultObject.Bind(outKey, ListValue{Elements: elements}, PublicVisibility)
 					} else {
 						// Sub-selecting objects
-						nestedResult, err := field.Selection.convertGraphQLResultToModule(fieldValue, field.Selection.Fields, schema, nestedField, typeScope)
+						nestedResult, err := field.Selection.convertGraphQLResultToModule(fieldValue, field.Selection.Fields, schema, nestedField, typeScope, client)
 						if err != nil {
 							return nil, fmt.Errorf("ObjectSelection.convertGraphQLResultToModule: nested field %q: %w", field.Name, err)
 						}
@@ -2537,7 +2538,7 @@ func (o *ObjectSelection) convertGraphQLResultToModule(result any, fields []*Fie
 						typeRef = nestedField.TypeRef
 						expectedType = nestedField.Directives.ExpectedType()
 					}
-					dangVal, err := graphQLResultToValue(fieldValue, typeRef, expectedType, schema, typeScope)
+					dangVal, err := graphQLResultToValue(fieldValue, typeRef, expectedType, schema, typeScope, client)
 					if err != nil {
 						return nil, fmt.Errorf("ObjectSelection.convertGraphQLResultToModule: converting field %q: %w", field.Name, err)
 					}

@@ -1,7 +1,10 @@
 package dang
 
 import (
+	"context"
 	"testing"
+
+	"github.com/Khan/genqlient/graphql"
 
 	"github.com/stretchr/testify/require"
 	"github.com/vito/dang/v2/pkg/hm"
@@ -113,6 +116,70 @@ func requireFunctionReturnType(t *testing.T, env TypeScope, funcName string) hm.
 	fn, ok := type_.(*hm.FunctionType)
 	require.True(t, ok)
 	return fn.Ret(false)
+}
+
+// An ID result whose field is annotated with @expectedType infers as the
+// expected object type, so at runtime it has to come back as a handle for that
+// object -- loaded via node(id:) -- rather than as the raw ID string.
+func TestExpectedTypeDirectivePromotesIDResultToObjectValue(t *testing.T) {
+	schema := expectedTypeTestSchema()
+	schema.Types.Get("Query").Fields = append(schema.Types.Get("Query").Fields, nodeLoaderTestField())
+	env := TypeScopeFromSchema("Dagger", schema)
+	client := graphql.NewClient("http://dang.test/query", nil)
+
+	val, err := graphQLResultToValue("cv-id", idTypeRef(), "CacheVolume", schema, env, client)
+	require.NoError(t, err)
+
+	gqlVal, ok := val.(GraphQLValue)
+	require.True(t, ok, "expected a GraphQL handle, got %T", val)
+	require.Equal(t, "CacheVolume", gqlVal.TypeName)
+	require.Equal(t, "cv-id", gqlVal.KnownID)
+
+	// The handle is chainable: further selections nest inside the fragment.
+	query, err := gqlVal.QueryChain.Select("id").Build(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, `{node(id:"cv-id"){... on CacheVolume{id}}}`, query)
+
+	// And it still marshals back to its ID for ID-typed arguments, without
+	// having to query for one.
+	id, err := gqlVal.ID(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "cv-id", id)
+}
+
+// Without a node(id:) field there is nothing to load the ID with, so the raw ID
+// string stays as-is -- it still satisfies the ID arguments it flows into.
+func TestExpectedTypeDirectiveKeepsIDResultWithoutNodeField(t *testing.T) {
+	schema := expectedTypeTestSchema()
+	env := TypeScopeFromSchema("Dagger", schema)
+	client := graphql.NewClient("http://dang.test/query", nil)
+
+	val, err := graphQLResultToValue("cv-id", idTypeRef(), "CacheVolume", schema, env, client)
+	require.NoError(t, err)
+	require.Equal(t, StringValue{Val: "cv-id"}, val)
+}
+
+func idTypeRef() *introspection.TypeRef {
+	return &introspection.TypeRef{
+		Kind: introspection.TypeKindNonNull,
+		OfType: &introspection.TypeRef{
+			Kind: introspection.TypeKindScalar,
+			Name: "ID",
+		},
+	}
+}
+
+func nodeLoaderTestField() *introspection.Field {
+	return &introspection.Field{
+		Name: "node",
+		Args: introspection.InputValues{
+			{Name: "id", TypeRef: idTypeRef()},
+		},
+		TypeRef: &introspection.TypeRef{
+			Kind: introspection.TypeKindObject,
+			Name: "CacheVolume",
+		},
+	}
 }
 
 func expectedTypeTestSchema() *introspection.Schema {

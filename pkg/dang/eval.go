@@ -258,7 +258,7 @@ func (g GraphQLFunction) Call(ctx context.Context, scope ValueScope, args map[st
 			return nil, fmt.Errorf("executing GraphQL query for %s.%s: %w", g.TypeName, g.Name, err)
 		}
 
-		return graphQLResultToValue(result, g.Field.TypeRef, g.Field.Directives.ExpectedType(), g.Schema, g.TypeScope)
+		return graphQLResultToValue(result, g.Field.TypeRef, g.Field.Directives.ExpectedType(), g.Schema, g.TypeScope, g.Client)
 	}
 
 	// For non-scalar types, return a GraphQLValue that can be further selected
@@ -301,6 +301,12 @@ type GraphQLValue struct {
 	TypeScope  TypeScope               // Type environment for looking up enum types
 	QueryChain *querybuilder.Selection // Keep track of the query chain built so far
 	IsMutation bool                    // True if this value came from a mutation
+
+	// KnownID is the object's ID when this value was built by loading that ID
+	// (see loadObjectFromID). Selecting `id` on such a chain would just hand
+	// back the same ID, so remembering it saves a round trip whenever the value
+	// flows into an ID-typed argument.
+	KnownID string
 }
 
 func (g GraphQLValue) Type() hm.Type {
@@ -312,12 +318,25 @@ func (g GraphQLValue) String() string {
 }
 
 func (g GraphQLValue) MarshalJSON() ([]byte, error) {
-	var id string
-	err := g.QueryChain.Select("id").Client(g.Client).Bind(&id).Execute(context.TODO())
+	id, err := g.ID(context.TODO())
 	if err != nil {
 		return nil, err
 	}
 	return json.Marshal(id)
+}
+
+// ID resolves the value's GraphQL ID, querying for it unless it is already
+// known from having loaded the value by ID in the first place.
+func (g GraphQLValue) ID(ctx context.Context) (string, error) {
+	if g.KnownID != "" {
+		return g.KnownID, nil
+	}
+	var id string
+	err := g.QueryChain.Select("id").Client(g.Client).Bind(&id).Execute(ctx)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // SelectField handles field selection on a GraphQLValue
@@ -811,7 +830,79 @@ func getTypeName(typeRef *introspection.TypeRef) string {
 	return currentType.Name
 }
 
-func graphQLResultToValue(raw any, typeRef *introspection.TypeRef, expectedType string, schema *introspection.Schema, typeScope TypeScope) (Value, error) {
+// loadObjectFromID turns an ID into a lazy handle for the object or interface
+// it identifies, so that a field typed as that object by @expectedType can be
+// chained onto like any other object-returning field.
+//
+// The ID is loaded through the schema's Relay-style `node(id:)` root field,
+// which returns an interface, so the concrete type is reached with an inline
+// fragment: node(id: "...") { ... on Container { ... } }.
+//
+// Returns nil (and no error) if the schema has no `node` field to load with, in
+// which case the caller keeps the raw ID string.
+func loadObjectFromID(id, typeName string, schema *introspection.Schema, typeScope TypeScope, client graphql.Client) (Value, error) {
+	if schema == nil || typeScope == nil || client == nil {
+		return nil, nil
+	}
+	nodeField := nodeLoaderField(schema)
+	if nodeField == nil {
+		return nil, nil
+	}
+	schemaType := schema.Types.Get(typeName)
+	if schemaType == nil {
+		return nil, fmt.Errorf("loading %s from ID: type not found in schema", typeName)
+	}
+	loadedType, found := typeScope.NamedType(typeName)
+	if !found {
+		return nil, fmt.Errorf("loading %s from ID: type not found", typeName)
+	}
+	return GraphQLValue{
+		Name:     nodeField.Name,
+		TypeName: typeName,
+		// Selections on this value resolve their types through Field, so it has
+		// to describe the loaded type rather than `node`'s interface return
+		// type, which is all the inline fragment leaves visible.
+		Field: &introspection.Field{
+			Name: nodeField.Name,
+			TypeRef: &introspection.TypeRef{
+				Kind: introspection.TypeKindNonNull,
+				OfType: &introspection.TypeRef{
+					Kind: schemaType.Kind,
+					Name: typeName,
+				},
+			},
+		},
+		ValType:   hm.NonNullType{Type: loadedType},
+		Client:    client,
+		Schema:    schema,
+		TypeScope: typeScope,
+		QueryChain: querybuilder.Query().Client(client).
+			Select(nodeField.Name).Arg("id", id).
+			InlineFragment(typeName),
+		KnownID: id,
+	}, nil
+}
+
+// nodeLoaderField returns the schema's `node(id:)` root field, the Relay-style
+// convention for loading any object by its ID, or nil if the schema has none.
+func nodeLoaderField(schema *introspection.Schema) *introspection.Field {
+	queryType := schema.Types.Get(schema.QueryType.Name)
+	if queryType == nil {
+		return nil
+	}
+	for _, field := range queryType.Fields {
+		if field.Name != "node" || len(field.Args) != 1 || field.Args[0].Name != "id" {
+			continue
+		}
+		if !isObjectLikeType(field.TypeRef, schema) {
+			continue
+		}
+		return field
+	}
+	return nil
+}
+
+func graphQLResultToValue(raw any, typeRef *introspection.TypeRef, expectedType string, schema *introspection.Schema, typeScope TypeScope, client graphql.Client) (Value, error) {
 	if typeRef == nil {
 		return ToValue(raw)
 	}
@@ -821,7 +912,7 @@ func graphQLResultToValue(raw any, typeRef *introspection.TypeRef, expectedType 
 		if raw == nil {
 			return nil, fmt.Errorf("null is not allowed for %s", getTypeName(typeRef))
 		}
-		return graphQLResultToValue(raw, typeRef.OfType, expectedType, schema, typeScope)
+		return graphQLResultToValue(raw, typeRef.OfType, expectedType, schema, typeScope, client)
 	case introspection.TypeKindList:
 		if raw == nil {
 			return NullValue{}, nil
@@ -832,7 +923,7 @@ func graphQLResultToValue(raw any, typeRef *introspection.TypeRef, expectedType 
 		}
 		values := make([]Value, len(items))
 		for i, item := range items {
-			converted, err := graphQLResultToValue(item, typeRef.OfType, expectedType, schema, typeScope)
+			converted, err := graphQLResultToValue(item, typeRef.OfType, expectedType, schema, typeScope, client)
 			if err != nil {
 				return nil, fmt.Errorf("converting list element %d: %w", i, err)
 			}
@@ -856,6 +947,21 @@ func graphQLResultToValue(raw any, typeRef *introspection.TypeRef, expectedType 
 		str, ok := raw.(string)
 		if !ok {
 			return nil, fmt.Errorf("expected string for GraphQL %s, got %T", typeRef.Name, raw)
+		}
+		if typeRef.Name == "ID" && expectedType != "" {
+			// @expectedType makes an ID-returning field infer as the object it
+			// identifies (see gqlOutputTypeRefToTypeNode), so the runtime has to
+			// hand back something you can actually select fields on, not the raw
+			// ID string. Load the ID back into a lazy handle for that type; the
+			// value keeps behaving as an ID wherever one is expected, since
+			// arguments marshal it back through GraphQLValue.ID.
+			val, err := loadObjectFromID(str, expectedType, schema, typeScope, client)
+			if err != nil {
+				return nil, err
+			}
+			if val != nil {
+				return val, nil
+			}
 		}
 		return StringValue{Val: str}, nil
 	case "Int":
@@ -1019,12 +1125,7 @@ func (m gqlObjectMarshaller) XXX_GraphQLIDType() string {
 
 // XXX_GraphqlID is an internal function. It returns the underlying type ID
 func (m gqlObjectMarshaller) XXX_GraphQLID(ctx context.Context) (string, error) {
-	var res string
-	query := m.val.QueryChain.Select("id").Bind(&res).Client(m.val.Client)
-	if err := query.Execute(ctx); err != nil {
-		return "", err
-	}
-	return res, nil
+	return m.val.ID(ctx)
 }
 
 func (m gqlObjectMarshaller) MarshalJSON() ([]byte, error) {

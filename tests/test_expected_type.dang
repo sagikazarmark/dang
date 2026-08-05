@@ -36,4 +36,27 @@ assert { favoriteNames[1] == "Jane Smith" }
 returnedNode: Node! = favoriteNodeID
 assert { nodeLabel(node: returnedNode) == "User:John Doe" }
 
+# Since they infer as the expected type, promoted ID return values are also
+# selectable as that type: the ID is loaded back into an object handle rather
+# than left as the raw ID string.
+assert { john.sync.name == "John Doe" }
+assert { favoriteUserID.name == "John Doe" }
+assert { favoriteUserID.{{ name, age }}.name == "John Doe" }
+assert { john.sync.posts(first: 1).posts.{{ title }}[0].title == "First Post" }
+assert { returnedUsers[1].name == "Jane Smith" }
+assert { returnedNode.id == john.id }
+
+# Same when the promoted ID comes back as part of a batched selection, whether
+# plain or inside an inline fragment.
+assert { john.{{ sync }}.sync.name == "John Doe" }
+let syncedNodes = nodes.{{
+  ... on User {{ sync }}
+  ... on Post {{ title }}
+}}
+let syncedNode = case (syncedNodes[0]) {
+  u: User => u.sync.name
+  else => "other"
+}
+assert { syncedNode == "John Doe" }
+
 print("expectedType directive tests passed!")
